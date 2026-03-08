@@ -85,13 +85,13 @@ export interface Terminal {
 	setTitle(title: string): void; // Set terminal window title
 
 	/**
-	 * Register a callback for Mode 2031 dark/light appearance change notifications.
-	 * Supported by Ghostty, Kitty, Contour, VTE (GNOME Terminal), and tmux 3.6+.
-	 * The callback fires when the terminal reports a change; it does NOT fire for the initial query.
+	 * Register a callback for terminal appearance (dark/light) changes.
+	 * Detection uses OSC 11 background color query with Mode 2031 as a change trigger.
+	 * Fires when the detected appearance changes; also fires for the initial detection.
 	 */
 	onAppearanceChange(callback: (appearance: TerminalAppearance) => void): void;
 
-	/** The last appearance reported by the terminal, or undefined if not yet known. */
+	/** The last detected terminal appearance, or undefined if not yet known. */
 	get appearance(): TerminalAppearance | undefined;
 }
 
@@ -110,6 +110,7 @@ export class ProcessTerminal implements Terminal {
 	#windowsVTInputRestore?: () => void;
 	#appearanceCallbacks: Array<(appearance: TerminalAppearance) => void> = [];
 	#appearance: TerminalAppearance | undefined;
+	#osc11Pending = false;
 
 	get kittyProtocolActive(): boolean {
 		return this.#kittyProtocolActive;
@@ -161,12 +162,18 @@ export class ProcessTerminal implements Terminal {
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.#queryAndEnableKittyProtocol();
 
-		// Enable Mode 2031: terminal will send DSR notifications on dark/light appearance changes.
-		// Query current mode with CSI ? 996 n, then subscribe with CSI ? 2031 h.
-		// Supported by Ghostty, Kitty, Contour, VTE/GNOME Terminal, tmux 3.6+.
-		// Unsupported terminals silently ignore these sequences.
-		this.#safeWrite("\x1b[?996n"); // Query current appearance
-		this.#safeWrite("\x1b[?2031h"); // Subscribe to appearance changes
+		// Query terminal background color via OSC 11 for dark/light detection.
+		// Uses DA1 (Primary Device Attributes) as a sentinel: terminals process
+		// sequences in order, so if DA1 response arrives before OSC 11 response,
+		// the terminal does not support OSC 11. This avoids indefinite hangs.
+		// Technique used by Neovim, bat, fish, and charmbracelet/lipgloss.
+		this.#queryBackgroundColor();
+
+		// Subscribe to Mode 2031 appearance change notifications.
+		// When the terminal reports a change, we re-query OSC 11 to get the
+		// actual background color rather than trusting the binary dark/light
+		// value from Mode 2031 directly (following Neovim/fish convention).
+		this.#safeWrite("\x1b[?2031h");
 	}
 
 	/**
@@ -236,6 +243,13 @@ export class ProcessTerminal implements Terminal {
 		// Mode 2031 DSR response pattern: \x1b[?997;{1=dark,2=light}n
 		const appearanceDsrPattern = /^\x1b\[\?997;([12])n$/;
 
+		// OSC 11 response: \x1b]11;rgb:RRRR/GGGG/BBBB(ST or BEL)
+		// Also handles rgba: format from some terminals
+		const osc11ResponsePattern = /^\x1b\]11;rgba?:([0-9a-fA-F]+)\/([0-9a-fA-F]+)\/([0-9a-fA-F]+)/;
+
+		// DA1 (Primary Device Attributes) response: \x1b[?...c
+		const da1ResponsePattern = /^\x1b\[\?[\d;]*c$/;
+
 		// Forward individual sequences to the input handler
 		this.#stdinBuffer.on("data", (sequence: string) => {
 			// Check for Kitty protocol response (only if not already enabled)
@@ -254,23 +268,28 @@ export class ProcessTerminal implements Terminal {
 				}
 			}
 
-			// Check for Mode 2031 appearance DSR response: CSI ? 997 ; {1,2} n
+			// OSC 11 response: parse RGB and compute luminance for dark/light
+			const osc11Match = sequence.match(osc11ResponsePattern);
+			if (osc11Match) {
+				this.#osc11Pending = false;
+				this.#handleOsc11Response(osc11Match[1]!, osc11Match[2]!, osc11Match[3]!);
+				return;
+			}
+
+			// DA1 response: if OSC 11 is still pending, the terminal doesn't support it
+			if (this.#osc11Pending && da1ResponsePattern.test(sequence)) {
+				this.#osc11Pending = false;
+				return;
+			}
+
+			// Mode 2031 appearance change notification: re-query OSC 11 for the
+			// actual background color instead of using the binary dark/light value.
 			const appearanceMatch = sequence.match(appearanceDsrPattern);
 			if (appearanceMatch) {
-				const mode: TerminalAppearance = appearanceMatch[1] === "1" ? "dark" : "light";
-				const changed = mode !== this.#appearance;
-				this.#appearance = mode;
-				if (changed) {
-					for (const cb of this.#appearanceCallbacks) {
-						try {
-							cb(mode);
-						} catch {
-							/* ignore callback errors */
-						}
-					}
-				}
-				return; // Don't forward DSR to TUI
+				this.#queryBackgroundColor();
+				return;
 			}
+
 			if (this.#inputHandler) {
 				this.#inputHandler(sequence);
 			}
@@ -287,6 +306,49 @@ export class ProcessTerminal implements Terminal {
 		this.#stdinDataHandler = (data: string) => {
 			this.#stdinBuffer!.process(data);
 		};
+	}
+
+	/**
+	 * Send OSC 11 background color query followed by DA1 sentinel.
+	 * The DA1 sentinel avoids indefinite hangs: if the DA1 response arrives
+	 * before the OSC 11 response, the terminal does not support OSC 11.
+	 */
+	#queryBackgroundColor(): void {
+		this.#osc11Pending = true;
+		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
+		this.#safeWrite("\x1b[c"); // DA1 sentinel
+	}
+
+	/**
+	 * Parse an OSC 11 background color response and compute luminance.
+	 * Handles both 4-digit (e.g. rgb:1a1a/2b2b/3c3c) and 2-digit (e.g. rgb:1a/2b/3c) forms.
+	 * Uses BT.601 luminance (same formula as Neovim and fish shell).
+	 */
+	#handleOsc11Response(rHex: string, gHex: string, bHex: string): void {
+		// Normalize to 0-1 range. Terminals may respond with 2 or 4 hex digits per channel.
+		const normalize = (hex: string): number => {
+			const value = parseInt(hex, 16);
+			if (Number.isNaN(value)) return 0;
+			// 2-digit: max 0xFF, 4-digit: max 0xFFFF
+			return hex.length <= 2 ? value / 0xff : value / 0xffff;
+		};
+		const r = normalize(rHex);
+		const g = normalize(gHex);
+		const b = normalize(bHex);
+		// BT.601 perceived luminance
+		const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+		const mode: TerminalAppearance = luminance < 0.5 ? "dark" : "light";
+		const changed = mode !== this.#appearance;
+		this.#appearance = mode;
+		if (changed) {
+			for (const cb of this.#appearanceCallbacks) {
+				try {
+					cb(mode);
+				} catch {
+					/* ignore callback errors */
+				}
+			}
+		}
 	}
 
 	/**
@@ -350,6 +412,7 @@ export class ProcessTerminal implements Terminal {
 		// Disable Mode 2031 appearance change notifications
 		this.#safeWrite("\x1b[?2031l");
 		this.#appearanceCallbacks = [];
+		this.#osc11Pending = false;
 
 		// Disable Kitty keyboard protocol if not already done by drainInput()
 		if (this.#kittyProtocolActive) {

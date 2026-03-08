@@ -11,7 +11,6 @@ import { $env, getNativesDir, logger } from "@oh-my-pi/pi-utils";
 import packageJson from "../package.json";
 import type { NativeBindings } from "./bindings";
 import { embeddedAddon } from "./embedded-addon";
-import "./appearance/types";
 import "./ast/types";
 import "./clipboard/types";
 import "./glob/types";
@@ -273,8 +272,6 @@ function validateNative(bindings: NativeBindings, source: string): void {
 	checkFn("invalidateFsScanCache");
 	checkFn("astGrep");
 	checkFn("astEdit");
-	checkFn("detectMacOSAppearance");
-	checkFn("MacAppearanceObserver");
 	checkFn("projfsOverlayProbe");
 	checkFn("projfsOverlayStart");
 	checkFn("projfsOverlayStop");

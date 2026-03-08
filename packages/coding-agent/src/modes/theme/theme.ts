@@ -3,11 +3,9 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Effort } from "@oh-my-pi/pi-ai";
 import {
-	detectMacOSAppearance,
 	type HighlightColors as NativeHighlightColors,
 	highlightCode as nativeHighlightCode,
 	supportsLanguage as nativeSupportsLanguage,
-	startMacAppearanceObserver as startNativeMacObserver,
 } from "@oh-my-pi/pi-natives";
 import type { EditorTheme, MarkdownTheme, SelectListTheme, SymbolTheme } from "@oh-my-pi/pi-tui";
 import { adjustHsv, getCustomThemesDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
@@ -1630,20 +1628,18 @@ export async function getThemeByName(name: string): Promise<Theme | undefined> {
 	}
 }
 
-/** Appearance reported by Mode 2031 (terminal DSR), or undefined if not (yet) available. */
+/** Appearance detected via OSC 11 background color query, or undefined if not (yet) available. */
 var terminalReportedAppearance: "dark" | "light" | undefined;
 
-/** Appearance reported by native macOS observer, or undefined if not (yet) available. */
-var macOSReportedAppearance: "dark" | "light" | undefined;
-
 function detectTerminalBackground(): "dark" | "light" {
-	// Prefer terminal-reported appearance from Mode 2031 (CSI ? 997 ; {1,2} n)
+	// Tier 1: Terminal-reported appearance from OSC 11 background color query.
+	// Set asynchronously when the terminal responds to the OSC 11 query at startup,
+	// and updated when Mode 2031 triggers a re-query.
 	if (terminalReportedAppearance) {
 		return terminalReportedAppearance;
 	}
-	// COLORFGBG is set by the terminal emulator to reflect the actual profile colors.
-	// Check it before macOS system appearance because the terminal profile may differ
-	// from the OS-level dark/light setting (e.g. dark terminal on macOS light mode).
+	// Tier 2: COLORFGBG env var — set by some terminal emulators (iTerm2, Konsole, rxvt).
+	// Static at process start, never updates mid-session.
 	const colorfgbg = Bun.env.COLORFGBG || "";
 	if (colorfgbg) {
 		const parts = colorfgbg.split(";");
@@ -1654,12 +1650,18 @@ function detectTerminalBackground(): "dark" | "light" {
 			}
 		}
 	}
-	// macOS: query system appearance via CoreFoundation (native, no shell).
-	// Uses cached observer value, or falls back to CFPreferencesCopyAppValue.
-	// Works on all terminals including Warp which lacks Mode 2031 / OSC 11.
-	const macAppearance = macOSReportedAppearance ?? detectMacOSAppearance();
-	if (macAppearance) {
-		return macAppearance;
+	// Tier 3: macOS system appearance (last resort for terminals without OSC 11 or COLORFGBG).
+	// Covers Warp and any other macOS terminal that lacks terminal-level escape sequence support.
+	// Single sync `defaults read` — replaces the 415-line Rust CoreFoundation FFI module.
+	if (process.platform === "darwin") {
+		try {
+			const result = Bun.spawnSync(["defaults", "read", "-g", "AppleInterfaceStyle"]);
+			// macOS deletes this key entirely in light mode (exit code 1), sets "Dark" in dark mode.
+			if (result.exitCode === 0 && result.stdout.toString().trim() === "Dark") return "dark";
+			return "light";
+		} catch {
+			// defaults command unavailable, fall through
+		}
 	}
 	return "dark";
 }
@@ -1802,15 +1804,14 @@ export function setAutoThemeMapping(mode: "dark" | "light", themeName: string): 
 }
 
 /**
- * Called when the terminal reports a dark/light appearance change via Mode 2031.
- * Updates the cached appearance and triggers auto-theme re-evaluation.
- * This is the cross-platform mechanism supported by Ghostty, Kitty, Contour,
- * VTE (GNOME Terminal), and tmux 3.6+.
+ * Called when the terminal detects a dark/light appearance change.
+ * The terminal layer queries OSC 11 (background color) and computes luminance;
+ * Mode 2031 notifications trigger re-queries rather than providing the value directly.
  */
 export function onTerminalAppearanceChange(mode: "dark" | "light"): void {
 	if (terminalReportedAppearance === mode) return;
 	terminalReportedAppearance = mode;
-	reevaluateAutoTheme("Mode 2031");
+	reevaluateAutoTheme("terminal appearance");
 }
 
 export function setThemeInstance(themeInstance: Theme): void {
@@ -1958,7 +1959,7 @@ async function startThemeWatcher(): Promise<void> {
 
 /**
  * Shared logic for re-evaluating the auto-detected theme.
- * Called from SIGWINCH, macOS observer, and Mode 2031 handler.
+ * Called from SIGWINCH and terminal appearance change handler.
  */
 function reevaluateAutoTheme(debugLabel: string): void {
 	if (!autoDetectedTheme) return;
@@ -1978,34 +1979,6 @@ function reevaluateAutoTheme(debugLabel: string): void {
 }
 
 // ============================================================================
-// macOS Appearance Observer
-// ============================================================================
-
-var macObserver: { stop(): void } | undefined;
-
-/** Start the native macOS appearance observer (CFDistributedNotificationCenter). */
-function startMacAppearanceObserver(): void {
-	stopMacAppearanceObserver();
-	if (process.platform !== "darwin") return;
-	try {
-		macObserver = startNativeMacObserver(appearance => {
-			macOSReportedAppearance = appearance;
-			if (!terminalReportedAppearance) reevaluateAutoTheme("macOS observer");
-		});
-	} catch (err) {
-		logger.warn("Failed to start macOS appearance observer", { err });
-	}
-}
-
-function stopMacAppearanceObserver(): void {
-	if (macObserver) {
-		macObserver.stop();
-		macObserver = undefined;
-	}
-	macOSReportedAppearance = undefined;
-}
-
-// ============================================================================
 // SIGWINCH Listener
 // ============================================================================
 
@@ -2016,8 +1989,6 @@ function startSigwinchListener(): void {
 		reevaluateAutoTheme("SIGWINCH");
 	};
 	process.on("SIGWINCH", sigwinchHandler);
-	// Start macOS appearance observer alongside SIGWINCH listener.
-	startMacAppearanceObserver();
 }
 
 function stopSigwinchListener(): void {
@@ -2025,7 +1996,6 @@ function stopSigwinchListener(): void {
 		process.removeListener("SIGWINCH", sigwinchHandler);
 		sigwinchHandler = undefined;
 	}
-	stopMacAppearanceObserver();
 }
 
 export function stopThemeWatcher(): void {
